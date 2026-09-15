@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    /* Language & runtime target */
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    /* Where things live */
+    "rootDir": "src",
+    "outDir": "dist",
+
+    /* Strict mode: this is the whole "TypeScript (Strict Mode)" requirement.
+       `strict: true` alone turns on strictNullChecks, noImplicitAny,
+       strictFunctionTypes, strictBindCallApply, strictPropertyInitialization,
+       noImplicitThis, alwaysStrict and useUnknownInCatchVariables together. */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Interop & module hygiene */
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+
+    /* Build output */
+    "sourceMap": true,
+    "declaration": false,
+    "removeComments": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/generated"]
+}

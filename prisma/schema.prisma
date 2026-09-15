@@ -1,0 +1,480 @@
+// BravoMart backend — Prisma schema
+//
+// Prisma 7 uses the Rust-free "prisma-client" generator by default. Two
+// things fall out of that which trip people up coming from older tutorials:
+//   1. `output` is required — the generated client is written into your own
+//      src tree instead of node_modules/@prisma/client.
+//   2. PrismaClient must be constructed with a driver adapter (see
+//      src/config/prisma.ts) instead of just `new PrismaClient()`.
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CUSTOMER
+  VENDOR
+  DISPATCHER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum VendorStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+/// Mirrors VendorStatus for the same reason: a dispatcher must pass a
+/// verification step (their ID + vehicle details) before they're allowed to
+/// pick up shipments, matching the "pending_verification" screen
+/// DispatcherPortal.jsx already renders while approval is pending.
+enum DispatcherStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+enum VehicleType {
+  MOTORCYCLE
+  TRICYCLE
+  CAR
+  VAN
+  TRUCK
+}
+
+/// Order-level status is a denormalized *aggregate* of its Shipments'
+/// statuses (see recomputeOrderStatus() in order.service.ts) — stored
+/// directly on Order, rather than computed with a join on every read,
+/// because "what's the status of my order" is the single most frequent
+/// query an order system serves and is worth optimizing for reads over
+/// writes (writes to order status are comparatively rare).
+enum OrderStatus {
+  AWAITING_PAYMENT
+  PROCESSING
+  PARTIALLY_DELIVERED
+  DELIVERED
+  COMPLETED
+  CANCELLED
+}
+
+/// Per-vendor fulfillment status. A single Order can contain several
+/// Shipments (one per vendor in the cart) that move through this pipeline
+/// completely independently — one vendor's item can be DELIVERED while
+/// another's is still PENDING, which is exactly what CheckoutPage.jsx's
+/// "multi-pickup" grouping already assumes on the frontend.
+enum ShipmentStatus {
+  PENDING
+  RIDER_ASSIGNED
+  PICKED_UP
+  OUT_FOR_DELIVERY
+  DELIVERED
+  DISPUTED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CARD
+  BANK_TRANSFER
+}
+
+/// Tracks money at the ORDER level (what the buyer paid, in aggregate).
+/// Per-vendor escrow release is tracked separately on each Shipment
+/// (`escrowStatus`) because different vendors in the same order are paid
+/// out at different times, as each one's delivery is confirmed.
+enum PaymentStatus {
+  PENDING
+  ESCROW_HELD
+  PARTIALLY_RELEASED
+  RELEASED
+  REFUNDED
+}
+
+enum EscrowStatus {
+  HELD
+  RELEASED
+  REFUNDED
+}
+
+/// Every entry that ever moves a vendor's `walletBalance` is recorded here
+/// FIRST, and the balance column is only ever updated inside the same
+/// database transaction as the matching ledger row (see
+/// services/wallet.service.ts). This is standard double-entry-adjacent
+/// bookkeeping: `walletBalance` is a fast, denormalized read of "the
+/// current total", while WalletTransaction is the durable, append-only
+/// source of truth an admin dispute or an audit can always replay from
+/// scratch to arrive at the same number.
+enum WalletTransactionType {
+  ESCROW_RELEASE
+  ESCROW_REFUND
+  PLATFORM_FEE
+  MANUAL_ADJUSTMENT
+}
+
+/// A single identity table for every kind of person who can log in —
+/// customers, vendors, dispatch riders and staff. `role` is what the RBAC
+/// middleware checks; role-specific data (like a vendor's shop) lives in its
+/// own related table instead of being bolted onto User with a pile of
+/// nullable columns.
+model User {
+  id                     String   @id @default(uuid())
+  fullName               String
+  email                  String?  @unique
+  username               String?  @unique
+  phone                  String?  @unique
+  passwordHash           String
+  role                   Role     @default(CUSTOMER)
+  primaryDeliveryAddress String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  vendorProfile VendorProfile?
+  refreshTokens RefreshToken[]
+  dispatchRiderProfile DispatchRiderProfile?
+  cart          Cart?
+  orders        Order[]
+
+  @@map("users")
+}
+
+/// Shop-specific data for users with role = VENDOR. Kept separate from User
+/// so that Product can point at "the shop" (VendorProfile) rather than "the
+/// login" (User) — a shop has a wallet balance, an address and a KYC status;
+/// a login does not.
+model VendorProfile {
+  id            String       @id @default(uuid())
+  userId        String       @unique
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shopName      String
+  shopAddress   String
+  homeAddress   String?
+  businessType  String?
+  idCardUrl     String?
+  /// Populated once by the vendor's "capture shop GPS" action
+  /// (AdminAiAssistant.jsx) via PATCH /api/vendor/me/location — previously
+  /// that button only updated local React state and was never persisted,
+  /// so every shipment's pickup distance was unmeasurable server-side.
+  /// Nullable because a brand-new vendor hasn't captured it yet; see
+  /// order.service.ts for the fallback used until they do.
+  shopLat       Float?
+  shopLng       Float?
+  walletBalance Decimal      @default(0) @db.Decimal(12, 2)
+  status        VendorStatus @default(PENDING)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  products Product[]
+  shipments Shipment[]
+  walletTransactions WalletTransaction[]
+
+  @@map("vendor_profiles")
+}
+
+/// Durable, auditable record of every refresh token ever issued. Redis is
+/// the fast, authoritative "is this token currently valid?" check on every
+/// /auth/refresh call (see src/services/token.service.ts); this table exists
+/// so a revoked/rotated token's history survives a Redis flush and so a user
+/// could one day be shown "your active sessions" and revoke one remotely.
+/// We store a SHA-256 hash of the token, never the raw token itself.
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  userAgent String?
+  ipAddress String?
+  isRevoked Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+/// Seeded once with the five values the AI product schema is locked to
+/// (Clothing, Electronics, Home, Beauty, Other — see prisma/seed.ts). Product
+/// stores a categoryId foreign key instead of a free-text/enum column so the
+/// AI-generated `category` string always resolves to a real, queryable row.
+model Category {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  slug      String   @unique
+  createdAt DateTime @default(now())
+
+  products Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id            String   @id @default(uuid())
+  title         String
+  description   String
+  price         Decimal  @db.Decimal(12, 2)
+  /// Vendor-supplied, used for distance × weight shipping calculations at
+  /// checkout (see utils/geo.ts + order.service.ts). Defaults to 1kg for
+  /// any product created before this column existed or where the vendor
+  /// didn't specify one.
+  weightKg      Decimal  @default(1) @db.Decimal(8, 2)
+  inventory     Int      @default(1)
+  tags          String[] @default([])
+  imageUrl      String?
+  isAiGenerated Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  vendorId String
+  vendor   VendorProfile @relation(fields: [vendorId], references: [id])
+
+  cartItems  CartItem[]
+  orderItems OrderItem[]
+
+  @@index([categoryId])
+  @@index([vendorId])
+  @@map("products")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cart
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One cart per user, created lazily on first add-to-cart (see
+/// services/cart.service.ts's getOrCreateCart()) rather than at
+/// registration — most users never add anything, so there's no reason for
+/// every signup to write a Cart row.
+model Cart {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     CartItem[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("carts")
+}
+
+/// Deliberately does NOT snapshot price: a cart is a "shopping intent", not
+/// a transaction, so it should always reflect the product's CURRENT price
+/// and stock — see cart.service.ts, which reads Product live on every cart
+/// fetch. Order/OrderItem (below) is where a price gets frozen forever,
+/// once the buyer actually checks out.
+model CartItem {
+  id        String   @id @default(uuid())
+  cartId    String
+  cart      Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity  Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // A product can only appear once per cart — adding it again increments
+  // `quantity` instead of creating a duplicate row (see cart.service.ts).
+  @@unique([cartId, productId])
+  @@index([productId])
+  @@map("cart_items")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Orders, shipments & dispatch
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The buyer-facing checkout transaction. Deliberately thin: it holds
+/// buyer-level identity (who, delivery address, payment, totals) and
+/// delegates all per-vendor fulfillment detail to Shipment. This is the
+/// standard multi-vendor-marketplace shape — a single cart spanning several
+/// vendors becomes ONE Order with several Shipments, not several unrelated
+/// orders, so the buyer has one order history entry and one payment receipt
+/// even though three different shops are fulfilling three different parts
+/// of it.
+model Order {
+  id        String @id @default(uuid())
+  /// Short, human-readable id shown in the UI (e.g. "BM-4821006635"),
+  /// separate from the UUID primary key used internally for joins — nobody
+  /// should have to read a UUID over a phone call to customer support.
+  orderNumber String @unique
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  status OrderStatus @default(AWAITING_PAYMENT)
+
+  // Delivery address is snapshotted as plain fields, not a foreign key to
+  // a mutable "Address" record — an order must keep showing the address it
+  // actually shipped to even if the buyer edits or deletes that address
+  // from their account later.
+  deliveryAddress String
+  deliveryLat     Float?
+  deliveryLng     Float?
+
+  paymentMethod PaymentMethod
+  paymentStatus PaymentStatus @default(PENDING)
+
+  subtotal        Decimal @db.Decimal(12, 2)
+  shippingTotal   Decimal @db.Decimal(12, 2)
+  platformFeeTotal Decimal @db.Decimal(12, 2)
+  grandTotal      Decimal @db.Decimal(12, 2)
+
+  shipments Shipment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@map("orders")
+}
+
+/// One vendor's slice of an Order — their items, their pickup address,
+/// their assigned rider, their own fulfillment status and their own escrow
+/// hold. Named "Shipment" rather than "VendorOrder" to match the
+/// pickup → dispatch → delivery language already used throughout
+/// DispatchConfigurator.jsx / AdminAiAssistant.jsx on the frontend.
+model Shipment {
+  id      String @id @default(uuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  vendorId String
+  vendor   VendorProfile @relation(fields: [vendorId], references: [id])
+
+  status ShipmentStatus @default(PENDING)
+
+  // Pickup location is snapshotted from the vendor's shop (or a
+  // vendor-chosen alternate pickup point — see AdminAiAssistant.jsx's
+  // "isCustomPickup" flow) at the time the order was placed, for the same
+  // reason delivery address is snapshotted on Order.
+  pickupAddress String
+  pickupLat     Float?
+  pickupLng     Float?
+
+  distanceKm  Decimal @db.Decimal(6, 2)
+  weightKg    Decimal @db.Decimal(8, 2)
+  itemsTotal  Decimal @db.Decimal(12, 2)
+  shippingFee Decimal @db.Decimal(12, 2)
+
+  dispatchRiderId String?
+  dispatchRider   DispatchRiderProfile? @relation(fields: [dispatchRiderId], references: [id])
+
+  riderAssignedAt  DateTime?
+  riderConfirmedAt DateTime?
+  pickedUpAt       DateTime?
+  deliveredAt      DateTime?
+
+  // Escrow is tracked PER SHIPMENT, not per order: vendor A's payout
+  // shouldn't wait on vendor B's delivery just because they happened to
+  // share a cart. `escrowReleaseAt` is when the funds auto-release if the
+  // buyer never explicitly confirms — see wallet.service.ts.
+  escrowStatus    EscrowStatus @default(HELD)
+  escrowReleaseAt DateTime?
+
+  items OrderItem[]
+  walletTransactions WalletTransaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([vendorId])
+  @@index([dispatchRiderId])
+  @@index([status])
+  @@map("shipments")
+}
+
+/// Line items are fully snapshotted (title/price/image/weight) at checkout
+/// time and `productId` is optional with `onDelete: SetNull` — a vendor
+/// deleting a product two years from now must never corrupt or delete a
+/// customer's historical order. `product` (if still present) is only kept
+/// as a convenience link back to the live listing, never read for pricing.
+model OrderItem {
+  id         String   @id @default(uuid())
+  shipmentId String
+  shipment   Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  productId String?
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  titleSnapshot String
+  imageSnapshot String?
+  priceSnapshot Decimal @db.Decimal(12, 2)
+  weightKgSnapshot Decimal @db.Decimal(8, 2) @default(1)
+  quantity      Int     @default(1)
+  lineTotal     Decimal @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+
+  @@index([shipmentId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+/// Shop-specific data mirrors VendorProfile's relationship to User: a
+/// dispatcher's login lives on User, everything about their rider identity
+/// (vehicle, live location, approval, wallet) lives here.
+model DispatchRiderProfile {
+  id       String @id @default(uuid())
+  userId   String @unique
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  vehicleType        VehicleType
+  vehicleRegNumber   String
+  currentResidentialAddress String
+  permanentHomeAddress      String
+  idCardUrl          String?
+
+  status      DispatcherStatus @default(PENDING)
+  isAvailable Boolean          @default(false)
+  currentLat  Float?
+  currentLng  Float?
+
+  walletBalance Decimal @default(0) @db.Decimal(12, 2)
+  rating        Decimal @default(5.0) @db.Decimal(3, 2)
+
+  shipments Shipment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, isAvailable, vehicleType])
+  @@map("dispatch_rider_profiles")
+}
+
+/// The append-only ledger backing every vendor's `walletBalance`. See the
+/// WalletTransactionType enum doc comment above for why this exists
+/// alongside (not instead of) the denormalized balance column.
+model WalletTransaction {
+  id String @id @default(uuid())
+
+  vendorId String
+  vendor   VendorProfile @relation(fields: [vendorId], references: [id])
+
+  shipmentId String?
+  shipment   Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+
+  type          WalletTransactionType
+  /// Positive = credited to the vendor, negative = debited (e.g. a refund
+  /// clawing back a previously-released escrow payment).
+  amount        Decimal @db.Decimal(12, 2)
+  /// The vendor's `walletBalance` immediately after this entry was applied
+  /// — written inside the same transaction that updates the balance, so an
+  /// audit can always reconcile "sum of all entries" against "current
+  /// balance" and expect them to match exactly.
+  balanceAfter  Decimal @db.Decimal(12, 2)
+  description   String
+
+  createdAt DateTime @default(now())
+
+  @@index([vendorId])
+  @@index([shipmentId])
+  @@map("wallet_transactions")
+}
