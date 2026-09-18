@@ -6,6 +6,9 @@
 //      src tree instead of node_modules/@prisma/client.
 //   2. PrismaClient must be constructed with a driver adapter (see
 //      src/config/prisma.ts) instead of just `new PrismaClient()`.
+
+
+
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
@@ -13,7 +16,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  
 }
 
 enum Role {
